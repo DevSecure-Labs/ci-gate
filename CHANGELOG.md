@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.2
+
+- Test workflow only: pins the Python matrix to Ubuntu 24.04 (the new `ubuntu-latest` has no Python 3.9), stops one failing version from cancelling the others, and adds Python 3.13 and 3.14. No change to the Action or `gate.py`.
+
 ## v1.0.1
 
 - Removes Python bytecode cache files that were published by mistake in v1.0.0 and adds a `.gitignore`. No change to the Action or `gate.py`.
