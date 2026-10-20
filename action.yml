@@ -1,0 +1,91 @@
+name: DevSecure Intelligence CI gate
+description: Fail the build when scanner findings meet your DevSecure Final Priority threshold or are in CISA KEV, with an explained summary.
+author: DevSecure Limited
+branding:
+  icon: shield
+  color: blue
+inputs:
+  api-key:
+    description: DevSecure Intelligence API key (store it as a secret). Plans with /prioritize access.
+    required: true
+  scan-file:
+    description: Scanner output to read CVE IDs from (Trivy JSON, Grype JSON, SARIF, CycloneDX, or any text).
+    required: false
+    default: ""
+  cves:
+    description: Extra CVE IDs, comma or space separated.
+    required: false
+    default: ""
+  fail-on:
+    description: Lowest Final Priority that fails the build (critical, high, medium, low, none).
+    required: false
+    default: high
+  fail-on-kev:
+    description: Fail on any CVE in CISA KEV, whatever its priority (true/false).
+    required: false
+    default: "true"
+  allowlist:
+    description: File of accepted CVEs, one per line, optionally "# until YYYY-MM-DD reason".
+    required: false
+    default: .devsecure-allowlist
+  vex:
+    description: VEX file (OpenVEX, CycloneDX VEX or CSAF VEX). A not_affected / fixed statement stops a CVE blocking only for the exact package (purl with version) it names, and only if every affected package is covered.
+    required: false
+    default: ""
+  vex-scope:
+    description: component (default, exact purl + version per package) or cve (unscoped; an explicit opt-in for scans without package URLs).
+    required: false
+    default: component
+  vex-product:
+    description: Optional purl of the artefact being gated (e.g. pkg:oci/app@sha256:...); VEX statements for other products are ignored.
+    required: false
+    default: ""
+  vex-audit:
+    description: Path of the JSON audit of every VEX decision (document hash, statement, component, reason).
+    required: false
+    default: devsecure-vex-audit.json
+  on-api-error:
+    description: fail (default, fail closed) or warn when the API can't be reached.
+    required: false
+    default: fail
+  api-base:
+    description: API base URL.
+    required: false
+    default: https://api.intelligence.devsecure.io
+outputs:
+  blocked:
+    description: Number of blocking CVEs.
+    value: ${{ steps.gate.outputs.blocked }}
+  checked:
+    description: Number of CVEs ranked.
+    value: ${{ steps.gate.outputs.checked }}
+  allowlisted:
+    description: Number of CVEs that would block but are allowlisted or not affected (VEX).
+    value: ${{ steps.gate.outputs.allowlisted }}
+  vex-audit:
+    description: Path of the VEX audit file (set when vex is given); upload it as an artifact to keep it.
+    value: ${{ steps.gate.outputs.vex-audit }}
+runs:
+  using: composite
+  steps:
+    - id: gate
+      shell: bash
+      env:
+        DEVSECURE_API_KEY: ${{ inputs.api-key }}
+        DEVSECURE_API_BASE: ${{ inputs.api-base }}
+        INPUT_SCAN_FILE: ${{ inputs.scan-file }}
+        INPUT_CVES: ${{ inputs.cves }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_FAIL_ON_KEV: ${{ inputs.fail-on-kev }}
+        INPUT_ALLOWLIST: ${{ inputs.allowlist }}
+        INPUT_ON_API_ERROR: ${{ inputs.on-api-error }}
+        INPUT_VEX: ${{ inputs.vex }}
+        INPUT_VEX_SCOPE: ${{ inputs.vex-scope }}
+        INPUT_VEX_PRODUCT: ${{ inputs.vex-product }}
+        INPUT_VEX_AUDIT: ${{ inputs.vex-audit }}
+      run: |
+        args=(--fail-on "$INPUT_FAIL_ON" --fail-on-kev "$INPUT_FAIL_ON_KEV" --allowlist "$INPUT_ALLOWLIST" --on-api-error "$INPUT_ON_API_ERROR" --cves "$INPUT_CVES")
+        if [ -n "$INPUT_SCAN_FILE" ]; then args+=(--scan-file "$INPUT_SCAN_FILE"); fi
+        if [ -n "$INPUT_VEX" ]; then args+=(--vex "$INPUT_VEX" --vex-scope "$INPUT_VEX_SCOPE" --vex-audit "$INPUT_VEX_AUDIT"); fi
+        if [ -n "$INPUT_VEX" ] && [ -n "$INPUT_VEX_PRODUCT" ]; then args+=(--vex-product "$INPUT_VEX_PRODUCT"); fi
+        python3 "${{ github.action_path }}/gate.py" "${args[@]}"
