@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.1
+
+- Removes Python bytecode cache files that were published by mistake in v1.0.0 and adds a `.gitignore`. No change to the Action or `gate.py`.
+
 ## v1.0.0
 
 First public release.
