@@ -15,6 +15,7 @@ Exit codes: 0 pass, 1 blocked, 2 usage or API error (fail closed unless --on-api
 import argparse
 import datetime as dt
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -30,7 +31,24 @@ LEVEL = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 LABEL = {"critical_priority": "Critical", "high_priority": "High", "medium_priority": "Medium",
          "low_priority": "Low", "informational": "Informational", "unknown": "Unknown"}
 DEFAULT_API = "https://api.intelligence.devsecure.io"
-USER_AGENT = "devsecure-ci-gate/1.0"
+USER_AGENT = "devsecure-ci-gate/1.1"
+SCAN_KEYS = ("Results", "SchemaVersion", "ArtifactName", "matches", "bomFormat", "vulnerabilities", "runs")
+
+
+def _cmd(s):
+    """Data for a GitHub workflow command (::error::...): escaped so scan or VEX text can't start a new one."""
+    return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _prop(s):
+    """A workflow command property (title=...)."""
+    return _cmd(s).replace(":", "%3A").replace(",", "%2C")
+
+
+def _cell(s):
+    """One markdown table cell on one line: no control characters (a new line could start a workflow
+    command when the summary is printed) and no unescaped pipes."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(s)).replace("|", "\\|")
 
 
 # --- reading findings -----------------------------------------------------------------------
@@ -133,19 +151,42 @@ def parse_findings(text, components=None):
     return found
 
 
+def scan_kind(text):
+    """'report' for a scanner report we recognise (even with no findings), 'text' for other non-empty
+    text, 'empty' for an empty file, 'unrecognised' for JSON that is no scanner report we know."""
+    if not text.strip():
+        return "empty"
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return "text"
+    if isinstance(doc, dict) and any(k in doc for k in SCAN_KEYS):
+        return "report"
+    return "report" if CVE_RE.search(text) else "unrecognised"
+
+
 def parse_allowlist(text, today):
-    """Allowed CVEs (not expired) and expired entries. Lines: 'CVE-...  # until 2026-12-31 reason'."""
+    """Allowed CVEs (not expired) and expired entries. Lines: 'CVE-...  # until 2026-12-31 reason'.
+    Only the part before '#' names a CVE, so a commented-out entry allowlists nothing. An entry whose
+    comment sets an expiry ('until' or 'expires') without a valid YYYY-MM-DD date counts as expired:
+    a typo in the date never allowlists a CVE for ever."""
     allowed, expired = set(), set()
     for line in text.splitlines():
-        m = CVE_RE.search(line)
+        code, _, comment = line.partition("#")
+        m = CVE_RE.search(code)
         if not m:
             continue
         cve = m.group(0).upper()
-        until = re.search(r"until\s+(\d{4}-\d{2}-\d{2})", line)
-        if until and dt.date.fromisoformat(until.group(1)) < today:
-            expired.add(cve)
-        else:
+        when = re.search(r"\b(until|expires?)\b", comment, re.IGNORECASE)
+        if not when:
             allowed.add(cve)
+            continue
+        date = re.match(r"\s*:?\s*(\d{4}-\d{2}-\d{2})\b", comment[when.end():])
+        try:
+            until = dt.date.fromisoformat(date.group(1)) if date else None
+        except ValueError:
+            until = None
+        (expired if until is None or until < today else allowed).add(cve)
     return allowed, expired
 
 
@@ -359,22 +400,50 @@ def vex_decisions(components, statements, scope="component", product=None):
 
 # --- API ------------------------------------------------------------------------------------
 
-def prioritize(api, key, cves, batch=100, retries=4, opener=urllib.request.urlopen, sleep=time.sleep):
-    """All ranked items and not-found IDs, in batches; retries 429 (Retry-After) and 5xx."""
+class AuthError(RuntimeError):
+    """401/403: the key is missing, revoked or not allowed. Always fails, even with --on-api-error=warn."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: urllib would resend the Authorization header to the new host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _reply_data(reply, sent):
+    """ranked / not_found from a /prioritize reply, checked: every CVE sent must come back in one of them."""
+    if not isinstance(reply, dict):
+        raise RuntimeError("unexpected response from /api/v1/prioritize (not a JSON object)")
+    # /prioritize returns ranked / not_found at the top level (a "data" wrapper is accepted too).
+    data = reply if "ranked" in reply or "not_found" in reply else reply.get("data")
+    if not isinstance(data, dict) or not ("ranked" in data or "not_found" in data):
+        raise RuntimeError("unexpected response from /api/v1/prioritize (no ranked or not_found)")
+    ranked, missing = data.get("ranked") or [], data.get("not_found") or []
+    got = {str(x.get("cve_id", "")).upper() for x in ranked if isinstance(x, dict)} | {str(x).upper() for x in missing}
+    absent = [c for c in sent if c.upper() not in got]
+    if absent:
+        raise RuntimeError(f"incomplete response from /api/v1/prioritize: {len(absent)} of {len(sent)} CVEs "
+                           f"missing (first: {absent[0]})")
+    return [x for x in ranked if isinstance(x, dict)], missing
+
+
+def prioritize(api, key, cves, batch=100, retries=4, opener=_OPENER.open, sleep=time.sleep):
+    """All ranked items and not-found IDs, in batches; retries 429 (Retry-After), 5xx and network errors.
+    Fails (RuntimeError) on anything else, including a reply that doesn't account for every CVE sent."""
     ranked, missing = [], []
     for i in range(0, len(cves), batch):
-        body = json.dumps({"cve_ids": cves[i:i + batch]}).encode()
+        sent = cves[i:i + batch]
+        payload = json.dumps({"cve_ids": sent}).encode()
         for attempt in range(retries + 1):
-            req = urllib.request.Request(f"{api.rstrip('/')}/api/v1/prioritize", data=body, method="POST", headers={
+            req = urllib.request.Request(f"{api.rstrip('/')}/api/v1/prioritize", data=payload, method="POST", headers={
                 "Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": USER_AGENT})
             try:
                 with opener(req, timeout=60) as r:
-                    body = json.loads(r.read().decode())
-                # /prioritize returns ranked / not_found at the top level (a "data" wrapper is accepted too).
-                data = body if "ranked" in body or "not_found" in body else (body.get("data") or {})
-                ranked += data.get("ranked") or []
-                missing += data.get("not_found") or []
-                break
+                    reply = json.loads(r.read().decode())
             except urllib.error.HTTPError as e:
                 if (e.code == 429 or e.code >= 500) and attempt < retries:
                     wait = e.headers.get("Retry-After") if e.headers else None
@@ -385,12 +454,20 @@ def prioritize(api, key, cves, batch=100, retries=4, opener=urllib.request.urlop
                     detail = (json.loads(e.read().decode()).get("error") or {}).get("message") or ""
                 except Exception:  # noqa: BLE001 - best-effort error detail
                     pass
-                raise RuntimeError(f"HTTP {e.code} from /api/v1/prioritize {detail}".strip()) from e
-            except urllib.error.URLError as e:
+                err = AuthError if e.code in (401, 403) else RuntimeError
+                if 300 <= e.code < 400:
+                    detail = (detail + " (redirects are not followed, so the API key is never sent elsewhere)").strip()
+                raise err(f"HTTP {e.code} from /api/v1/prioritize {detail}".strip()) from e
+            except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError) as e:
+                # URLError, timeouts and resets while reading, a truncated or non-JSON body.
                 if attempt < retries:
                     sleep(2 ** attempt)
                     continue
-                raise RuntimeError(f"cannot reach {api}: {e.reason}") from e
+                raise RuntimeError(f"cannot get a response from {api}: {getattr(e, 'reason', None) or e}") from e
+            got_ranked, got_missing = _reply_data(reply, sent)
+            ranked += got_ranked
+            missing += got_missing
+            break
     return ranked, missing
 
 
@@ -430,12 +507,15 @@ def evaluate(ranked, allowed, fail_on, fail_on_kev, vex=None):
 
 def summary_markdown(blocked, allowlisted, passed, missing, expired, findings, fail_on, fail_on_kev):
     def row(item, why=""):
-        cve = item.get("cve_id", "")
-        pk = ", ".join(sorted(findings.get(cve.upper(), set()))[:3]) or "-"
+        # Package labels, VEX justifications and API text are untrusted: one line each, pipes escaped.
+        cve = _cell(item.get("cve_id", ""))
+        pk = _cell(", ".join(sorted(findings.get(cve.upper(), set()))[:3]) or "-")
         kev = "yes" if ((item.get("evidence") or {}).get("kev") or {}).get("listed") else "no"
         score = item.get("rps_score")
-        return (f"| [{cve}](https://intelligence.devsecure.io/cve/{cve}) | {LABEL.get(item.get('priority_band') or 'unknown')} | "
-                f"{'' if score is None else round(score, 1)} | {kev} | {pk} | {why or (item.get('reason') or '')[:90]} |")
+        score = round(score, 1) if isinstance(score, (int, float)) else ""
+        band = LABEL.get(item.get("priority_band") or "unknown", "Unknown")
+        return (f"| [{cve}](https://intelligence.devsecure.io/cve/{cve}) | {band} | "
+                f"{score} | {kev} | {pk} | {_cell(why or (item.get('reason') or '')[:90])} |")
 
     head = "| CVE | Final Priority | RPS | CISA KEV | Package | Why |\n|---|---|---|---|---|---|"
     out = ["## DevSecure CI gate", "",
@@ -451,13 +531,27 @@ def summary_markdown(blocked, allowlisted, passed, missing, expired, findings, f
     if passed:
         out += ["<details><summary>Below threshold</summary>", "", head] + [row(i) for i in passed[:200]] + ["", "</details>", ""]
     if missing:
-        out += [f"Not in DevSecure data: {', '.join(sorted(missing)[:50])}", ""]
+        out += [f"Not in DevSecure data: {_cell(', '.join(sorted(str(m) for m in missing)[:50]))}", ""]
     out.append("Final Priority is DevSecure's RPS band after the CISA KEV floor and EPSS gate. "
                "[How priority works](https://intelligence.devsecure.io/methodology#rps)")
     return "\n".join(out)
 
 
-def main(argv=None, env=None, opener=urllib.request.urlopen, sleep=time.sleep, today=None):
+def _api_ok(api):
+    """The key goes with every request: https only (plain http just for a local test server)."""
+    u = urllib.parse.urlsplit(api)
+    return u.scheme == "https" and bool(u.hostname) or (u.scheme == "http" and u.hostname in ("localhost", "127.0.0.1", "::1"))
+
+
+def _write_outputs(env, blocked, checked, allowlisted, vex_audit=None):
+    if env.get("GITHUB_OUTPUT"):
+        with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write(f"blocked={blocked}\nchecked={checked}\nallowlisted={allowlisted}\n")
+            if vex_audit:
+                f.write(f"vex-audit={vex_audit}\n")
+
+
+def main(argv=None, env=None, opener=_OPENER.open, sleep=time.sleep, today=None):
     env = os.environ if env is None else env
     ap = argparse.ArgumentParser(description="DevSecure CI gate")
     ap.add_argument("--cves", default="", help="comma/space separated CVE IDs")
@@ -478,14 +572,30 @@ def main(argv=None, env=None, opener=urllib.request.urlopen, sleep=time.sleep, t
     if not key:
         print("::error::DEVSECURE_API_KEY is not set (create a key at https://intelligence.devsecure.io/dashboard)")
         return 2
+    if not _api_ok(a.api):
+        print(f"::error::The API base must be an https:// URL, got {_cmd(a.api)} (the API key is sent with every request)")
+        return 2
 
     findings, components = {}, {}
     for vid in CVE_RE.findall(a.cves):
         _add(findings, vid, None, components)
     for path in a.scan_file:
+        # A missing, empty or unreadable report usually means the scanner failed: fail, don't pass.
+        if not os.path.isfile(path):
+            print(f"::error title=DevSecure CI gate::scan file {_cmd(path)} not found (did the scanner run?)")
+            return 2
         with open(path, encoding="utf-8", errors="replace") as f:
-            for cve, pkgs in parse_findings(f.read(), components).items():
-                findings.setdefault(cve, set()).update(pkgs)
+            text = f.read()
+        kind = scan_kind(text)
+        if kind in ("empty", "unrecognised"):
+            what = "is empty" if kind == "empty" else "is JSON but not a Trivy, Grype, SARIF or CycloneDX report"
+            print(f"::error title=DevSecure CI gate::scan file {_cmd(path)} {what} (did the scanner fail?)")
+            return 2
+        found = parse_findings(text, components)
+        if kind == "text" and not found:
+            print(f"::warning title=DevSecure CI gate::no CVE IDs in {_cmd(path)}; check it is the scanner's output")
+        for cve, pkgs in found.items():
+            findings.setdefault(cve, set()).update(pkgs)
     today = today or dt.date.today()
     allowed, expired = set(), set()
     if a.allowlist and os.path.exists(a.allowlist):
@@ -494,7 +604,7 @@ def main(argv=None, env=None, opener=urllib.request.urlopen, sleep=time.sleep, t
     statements, documents = [], []
     for path in a.vex:
         if not os.path.exists(path):
-            print(f"::warning title=DevSecure VEX::{path} not found; ignored")
+            print(f"::warning title=DevSecure VEX::{_cmd(path)} not found; ignored")
             continue
         with open(path, "rb") as f:
             raw = f.read()
@@ -502,28 +612,38 @@ def main(argv=None, env=None, opener=urllib.request.urlopen, sleep=time.sleep, t
         statements += found
         documents.append({"path": path, "sha256": hashlib.sha256(raw).hexdigest(), "statements": len(found)})
     vex = vex_decisions(components, statements, a.vex_scope, a.vex_product or None) if a.vex else {}
+    if a.vex and not a.vex_product and any(st.get("products") for st in statements):
+        print("::warning title=DevSecure VEX::some VEX statements are scoped to a product; set vex-product to your "
+              "image or application so statements about other products are not applied")
     cves = sorted(findings)
     if not cves:
         print("DevSecure CI gate: no CVE IDs found; nothing to check.")
+        _write_outputs(env, 0, 0, 0)
         return 0
     try:
         ranked, missing = prioritize(a.api, key, cves, batch=max(1, a.batch), opener=opener, sleep=sleep)
+    except AuthError as e:
+        # A revoked or wrong key must not quietly switch the gate off, even in warn mode.
+        print(f"::error::DevSecure CI gate could not rank findings: {_cmd(e)} (check DEVSECURE_API_KEY)")
+        return 2
     except RuntimeError as e:
-        print(f"::{'error' if a.on_api_error == 'fail' else 'warning'}::DevSecure CI gate could not rank findings: {e}")
+        print(f"::{'error' if a.on_api_error == 'fail' else 'warning'}::DevSecure CI gate could not rank findings: {_cmd(e)}")
         return 2 if a.on_api_error == "fail" else 0
 
     fail_on_kev = a.fail_on_kev == "true"
-    # /prioritize also lists not-found CVEs as "unknown" items; count them once, as not found.
-    missing_set = {m.upper() for m in missing}
-    ranked = [i for i in ranked if (i.get("priority_band") or "unknown") != "unknown" and i.get("cve_id", "").upper() not in missing_set]
+    # /prioritize also lists not-found CVEs as "unknown" items; count them once, as not found. A CVE that
+    # is found but has no band stays in: the CISA KEV check still applies to it.
+    missing_set = {str(m).upper() for m in missing}
+    ranked = [i for i in ranked if str(i.get("cve_id", "")).upper() not in missing_set]
     blocked, allowlisted, passed = evaluate(ranked, allowed, a.fail_on, fail_on_kev, vex)
     md = summary_markdown(blocked, allowlisted, passed, missing, expired, findings, a.fail_on, fail_on_kev)
     if env.get("GITHUB_STEP_SUMMARY"):
         with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
             f.write(md + "\n")
     for item, why in blocked:
-        print(f"::error title=DevSecure: {item.get('cve_id')}::{why}. "
-              f"https://intelligence.devsecure.io/cve/{item.get('cve_id')}")
+        cve = item.get("cve_id")
+        print(f"::error title={_prop(f'DevSecure: {cve}')}::{_cmd(why)}. "
+              f"https://intelligence.devsecure.io/cve/{_cmd(cve)}")
     for cve in sorted(expired):
         print(f"::warning title=DevSecure allowlist::{cve} allowlist entry expired; it is enforced again")
     print(md)
@@ -535,11 +655,7 @@ def main(argv=None, env=None, opener=urllib.request.urlopen, sleep=time.sleep, t
             json.dump(audit, f, indent=2)
         n = sum(1 for d in vex.values() if d["suppressed"])
         print(f"VEX: {n} CVE(s) suppressed, {len(vex) - n} mentioned but not suppressed; audit: {a.vex_audit}")
-    if env.get("GITHUB_OUTPUT"):
-        with open(env["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-            f.write(f"blocked={len(blocked)}\nchecked={len(ranked)}\nallowlisted={len(allowlisted)}\n")
-            if a.vex:
-                f.write(f"vex-audit={a.vex_audit}\n")
+    _write_outputs(env, len(blocked), len(ranked), len(allowlisted), a.vex_audit if a.vex else None)
     return 1 if blocked else 0
 
 

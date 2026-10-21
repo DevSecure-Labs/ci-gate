@@ -20,7 +20,7 @@ Your scanner finds the CVEs. DevSecure decides which ones matter now: RPS, Final
 ```
 
 - **Supported inputs:** Trivy JSON, Grype JSON (including related GHSA→CVE IDs), SARIF, CycloneDX vulnerabilities, or any text containing CVE IDs.
-- **Allowlist:** `.devsecure-allowlist`, one CVE per line, optionally `# until 2026-12-31 reason`. Expired entries are enforced again and flagged.
+- **Allowlist:** `.devsecure-allowlist`, one CVE per line, optionally `# until 2026-12-31 reason`. Text after `#` is a comment, so `# CVE-…` allowlists nothing. Expired entries, and entries whose `until`/`expires` date isn't a valid `YYYY-MM-DD`, are enforced again and flagged.
 - **VEX:** pass `vex:` (or `--vex`, repeatable) with an OpenVEX, CycloneDX VEX or CSAF VEX document. The rules are deliberately strict:
   - **Exact components only.** A `not_affected` / `fixed` / `resolved` / `false_positive` statement covers only the package URL **with version** it names (OpenVEX subcomponent or product, CycloneDX `affects[].ref`, CSAF product or relationship component). The scan must report that purl: Trivy `PkgIdentifier.PURL`, Grype `artifact.purl`, or CycloneDX components. A purl without a version never matches.
   - **Every affected package.** A CVE stops blocking only when every package the scan reports it in is covered.
@@ -28,7 +28,7 @@ Your scanner finds the CVEs. DevSecure decides which ones matter now: RPS, Final
   - **Product scope.** `vex-product: pkg:oci/app@sha256:...` ignores statements written for other products.
   - **Audit.** Every decision goes to `devsecure-vex-audit.json` (`vex-audit` output): document path and SHA-256, statement locator, status, justification, author, timestamp, component, and why it was or wasn't applied. Upload it with `actions/upload-artifact` to keep it with the build. Blocking CVEs that VEX mentions but doesn't cover say why in the summary.
   - **Unscoped opt-in.** `vex-scope: cve` applies CVE-level statements to scans without package URLs (text, SARIF). It's recorded as unscoped in the audit.
-- **Fail closed:** if the API can't be reached, the step fails (exit 2) unless you set `on-api-error: warn`.
+- **Fail closed:** the step fails (exit 2) if the API can't be reached or its reply doesn't account for every CVE sent (unless you set `on-api-error: warn`), if the key is rejected (401/403, even with `warn`), or if a scan file is missing, empty or JSON we don't recognise (the scanner probably failed). A CVE in CISA KEV blocks even when it has no priority band. The API base must be `https://`, and redirects are never followed, so the key is only ever sent to that host.
 - **Outputs:** `blocked`, `checked`, `allowlisted`, `vex-audit` (when `vex` is set).
 
 ## Any CI (CLI)

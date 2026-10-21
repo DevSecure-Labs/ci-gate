@@ -25,7 +25,7 @@ inputs:
     required: false
     default: "true"
   allowlist:
-    description: File of accepted CVEs, one per line, optionally "# until YYYY-MM-DD reason".
+    description: File of accepted CVEs, one per line, optionally "# until YYYY-MM-DD reason". Text after "#" is a comment; an expiry without a valid date counts as expired.
     required: false
     default: .devsecure-allowlist
   vex:
@@ -45,7 +45,7 @@ inputs:
     required: false
     default: devsecure-vex-audit.json
   on-api-error:
-    description: fail (default, fail closed) or warn when the API can't be reached.
+    description: fail (default, fail closed) or warn when the API can't be reached or replies badly. A rejected key (401/403) always fails.
     required: false
     default: fail
   api-base:
@@ -88,4 +88,4 @@ runs:
         if [ -n "$INPUT_SCAN_FILE" ]; then args+=(--scan-file "$INPUT_SCAN_FILE"); fi
         if [ -n "$INPUT_VEX" ]; then args+=(--vex "$INPUT_VEX" --vex-scope "$INPUT_VEX_SCOPE" --vex-audit "$INPUT_VEX_AUDIT"); fi
         if [ -n "$INPUT_VEX" ] && [ -n "$INPUT_VEX_PRODUCT" ]; then args+=(--vex-product "$INPUT_VEX_PRODUCT"); fi
-        python3 "${{ github.action_path }}/gate.py" "${args[@]}"
+        python3 "$GITHUB_ACTION_PATH/gate.py" "${args[@]}"
